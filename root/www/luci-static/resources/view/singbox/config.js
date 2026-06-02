@@ -1,5 +1,4 @@
 'use strict';
-'import ui';
 'import fs';
 'import view';
 'import form';
@@ -9,6 +8,7 @@ return L.view.extend({
     handleSaveApply: null,
     handleSave: null,
     handleReset: null,
+    lastSwitchTime: 0, // 核心：手動切換時間戳鎖，用來解決後台非同步寫入的時間差
 
     // --- 輔助：強健的 Base64 解碼 (處理各種訂閱與節點編碼) ---
     safeB64Decode: function(str) {
@@ -22,7 +22,7 @@ return L.view.extend({
         }
     },
 
-    // --- 核心 1：全協議節點解析器 (增強版，支援 Reality Vision / uTLS / ALPN) ---
+    // --- 核心 1：全協議節點解析器 (增強版) ---
     parseNodeLink: function(link) {
         if (!link || link.trim() === "") return null;
         link = link.trim();
@@ -35,7 +35,6 @@ return L.view.extend({
             var rawContent = protocolMatch[2];
             var node = null;
 
-            // 1. VMess 協議 (Base64 JSON)
             if (protocol === 'vmess') {
                 var vmessJson = JSON.parse(this.safeB64Decode(rawContent));
                 node = {
@@ -56,7 +55,6 @@ return L.view.extend({
                 return node;
             }
 
-            // 分離 URI 中的節點名稱
             var name = "Imported-Node";
             var parts = rawContent.split('#');
             if (parts.length > 1) {
@@ -75,7 +73,6 @@ return L.view.extend({
                 });
             }
 
-            // 2. VLESS / Trojan / Hysteria2
             if (['vless', 'trojan', 'hysteria2'].indexOf(protocol) !== -1) {
                 var authAddr = mainUrl.split('@');
                 var uuidOrPwd = authAddr[0];
@@ -87,38 +84,21 @@ return L.view.extend({
                 if (protocol === 'trojan' || protocol === 'hysteria2') node.password = uuidOrPwd;
                 else node.uuid = uuidOrPwd;
 
-                // [修復點 1] VLESS 專屬配置：開啟 xudp，並讀取 flow (如 xtls-rprx-vision)
                 if (protocol === 'vless') {
                     node.packet_encoding = "xudp"; 
-                    if (query.flow) {
-                        node.flow = query.flow;
-                    }
+                    if (query.flow) { node.flow = query.flow; }
                 }
 
                 if (query.security === 'tls' || query.security === 'reality' || protocol === 'hysteria2' || protocol === 'trojan') {
                     node.tls = { enabled: true, server_name: query.sni || query.peer || host, insecure: (query.allowInsecure === '1' || query.insecure === '1') };
-                    
-                    // [修復點 2] 支援 ALPN (如 h3, h2)
-                    if (query.alpn) {
-                        node.tls.alpn = query.alpn.split(',');
-                    }
-
-                    // [修復點 3] 支援 uTLS 指紋偽裝 (Reality 必備)
-                    if (query.fp) {
-                        node.tls.utls = { enabled: true, fingerprint: query.fp };
-                    } else if (query.security === 'reality') {
-                        // 如果鏈接沒寫 fp 但開啟了 reality，給一個默認的 chrome 指紋保底
-                        node.tls.utls = { enabled: true, fingerprint: "chrome" };
-                    }
-
-                    if (query.security === 'reality') {
-                        node.tls.reality = { enabled: true, public_key: query.pbk, short_id: query.sid || "" };
-                    }
+                    if (query.alpn) { node.tls.alpn = query.alpn.split(','); }
+                    if (query.fp) { node.tls.utls = { enabled: true, fingerprint: query.fp }; } 
+                    else if (query.security === 'reality') { node.tls.utls = { enabled: true, fingerprint: "chrome" }; }
+                    if (query.security === 'reality') { node.tls.reality = { enabled: true, public_key: query.pbk, short_id: query.sid || "" }; }
                 }
                 return node;
             }
 
-            // 3. Shadowsocks (SIP002)
             if (protocol === 'ss') {
                 var ssHostPort, ssMethodPwd;
                 if (mainUrl.indexOf('@') !== -1) {
@@ -141,7 +121,7 @@ return L.view.extend({
         }
     },
 
-    // --- 核心 2：統一編輯器 (無感導入 + 手工編輯) ---
+    // --- 核心 2：統一編輯器 ---
     openEditor: function(filename, initialContent, confdir) {
         var isNew = !filename;
         var currentName = filename || '';
@@ -167,57 +147,31 @@ return L.view.extend({
         ta.addEventListener('input', updateLineNumbers);
         setTimeout(updateLineNumbers, 50);
 
-        // 無感粘貼解析監聽 (嚴格執行「一文件一節點」標準)
         linkInput.addEventListener('input', L.bind(function(e) {
             var val = e.target.value.trim();
             if (!val || !/^[a-zA-Z0-9]+:\/\//.test(val)) return;
 
             var node = this.parseNodeLink(val);
             if (node) {
-                // 1. 自動提取並填充文件名
                 if (isNew && !nameInput.value.trim()) {
                     var safeName = (node.tag || 'Imported-Node').replace(/[^a-zA-Z0-9_\-\u4e00-\u9fa5]/g, '_');
                     nameInput.value = safeName + '.json';
                 }
 
-                // 2. 直接生成完美對接 daed 的標準完整配置文件
                 var standardConfig = {
-                    "log": {
-                        "level": "info",
-                        "timestamp": true
-                    },
-                    "inbounds": [
-                        {
-                            "type": "socks",
-                            "tag": "socks-in",
-                            "listen": "0.0.0.0",
-                            "listen_port": 10811,
-                            "udp_fragment": true
-                        }
-                    ],
-                    "outbounds": [
-                        node  // 將解析出的節點作為唯一的出口
-                    ],
+                    "log": { "level": "info", "timestamp": true },
+                    "inbounds": [ { "type": "socks", "tag": "socks-in", "listen": "0.0.0.0", "listen_port": 10811, "udp_fragment": true } ],
+                    "outbounds": [ node ],
                     "route": {
-                        "rules": [
-                            {
-                                "inbound": "socks-in",
-                                "action": "route",
-                                "outbound": node.tag // 自動路由指向該節點
-                            }
-                        ],
-                        "final": node.tag // 兜底路由也指向該節點
+                        "rules": [ { "inbound": "socks-in", "action": "route", "outbound": node.tag } ],
+                        "final": node.tag
                     }
                 };
                 
-                // 3. 渲染到代碼框
                 ta.value = JSON.stringify(standardConfig, null, 4);
-                
-                // 4. 視覺反饋
                 var originalBg = linkInput.style.background;
                 linkInput.style.background = '#d4edda';
                 setTimeout(function(){ linkInput.style.background = originalBg; }, 300);
-
                 e.target.value = ''; 
                 updateLineNumbers();
             }
@@ -248,41 +202,35 @@ return L.view.extend({
 
                     try {
                         var obj = JSON.parse(ta.value);
+                        var stringifyContent = JSON.stringify(obj, null, 4);
 
-                        // --- 隱形防呆校驗開始 ---
-                        var validOutboundTags = [];
-                        if (obj.outbounds && Array.isArray(obj.outbounds)) {
-                            for (var i = 0; i < obj.outbounds.length; i++) {
-                                if (obj.outbounds[i].tag) {
-                                    validOutboundTags.push(obj.outbounds[i].tag);
-                                }
+                        L.fs.write(confdir + '/' + finalName, stringifyContent).then(L.bind(function() {
+                            var currentActiveName = null;
+                            var activeRow = document.querySelector('tr[data-filename] .check-cell span');
+                            if (activeRow) {
+                                var rowTr = activeRow.closest('tr');
+                                if (rowTr) currentActiveName = rowTr.getAttribute('data-filename');
                             }
-                        }
+                            if (!currentActiveName) { currentActiveName = L.uci.get('sing-box', 'main', 'selected_conf'); }
 
-                        if (validOutboundTags.length === 0) {
-                            throw new Error("配置中必須至少包含一個有效的 outbound (出口節點)！");
-                        }
-
-                        if (obj.route) {
-                            if (obj.route.final && validOutboundTags.indexOf(obj.route.final) === -1) {
-                                throw new Error("路由邏輯錯誤：route.final 指向了不存在的節點 [" + obj.route.final + "]");
+                            if (finalName === currentActiveName) {
+                                return L.fs.write(confdir + '/config.json', stringifyContent).then(L.bind(function() {
+                                    return this.doRestart(); 
+                                }, this)).then(L.bind(function() {
+                                    window.sessionStorage.removeItem('sb_net_cache'); 
+                                    setTimeout(L.bind(this.checkNetwork, this, true), 1000); 
+                                    alert(_('當前生效配置已同步寫入主配置，服務已完成自動重啟重載！'));
+                                }, this));
+                            } else {
+                                alert(_('配置儲存成功（非當前生效節點，未觸發重載）。'));
                             }
-                            if (obj.route.rules && Array.isArray(obj.route.rules)) {
-                                for (var j = 0; j < obj.route.rules.length; j++) {
-                                    var rule = obj.route.rules[j];
-                                    if (rule.outbound && validOutboundTags.indexOf(rule.outbound) === -1) {
-                                        throw new Error("路由規則錯誤：第 " + (j + 1) + " 條規則指向了不存在的節點 [" + rule.outbound + "]");
-                                    }
-                                }
-                            }
-                        }
-                        // --- 隱形防呆校驗結束 ---
-
-                        L.fs.write(confdir + '/' + finalName, JSON.stringify(obj, null, 4)).then(L.bind(function() { 
+                        }, this)).then(L.bind(function() {
                             L.ui.hideModal(); 
                             var container = document.getElementById('sb_file_list_container');
                             if (container) this.renderList(container, confdir, L.uci.get('sing-box', 'main', 'selected_conf'));
-                        }, this));
+                        }, this)).catch(function(err) {
+                            alert(_('儲存或同步重載失敗: ') + (err.message || err));
+                        });
                     } catch(e) { alert(_('JSON 錯誤，無法儲存: \n') + e.message); }
                 }, this) }, _('儲存配置'))
             ])
@@ -335,7 +283,8 @@ return L.view.extend({
         });
     },
 
-    checkStatus: function() {
+    // --- 【修復＆同步核心 1】：動態靜默更新列表節點選中狀態，防止與 Web 端發生衝突 ---
+    checkStatus: function(confdir) {
         return L.fs.exec('/etc/init.d/sing-box', ['status']).then(L.bind(function(res) {
             var isRunning = (res.code === 0);
             var sDot = document.getElementById('sb_status_dot');
@@ -345,6 +294,43 @@ return L.view.extend({
                 sDot.style.background = isRunning ? '#46a546' : '#999';
             }
             this.checkNetwork(false);
+
+            // 【樂觀鎖阻斷】：如果本地剛切換了節點未滿 3 秒，暫停後台的覆蓋比對，避免重啟延遲導致的閃爍跳動
+            if (this.lastSwitchTime && (Date.now() - this.lastSwitchTime < 3000)) {
+                return;
+            }
+
+            // 【非同步指紋比對】：直接讀取當前物理 config.json 的 outbounds，從而同步 Web 端的變更
+            if (confdir) {
+                L.fs.read(confdir + '/config.json').then(L.bind(function(configContent) {
+                    if (!configContent) return;
+                    var activeOutboundsStr = "";
+                    try {
+                        var configJson = JSON.parse(configContent);
+                        if (configJson.outbounds) activeOutboundsStr = JSON.stringify(configJson.outbounds);
+                    } catch(e) { return; }
+
+                    if (!activeOutboundsStr) return;
+
+                    var rows = document.querySelectorAll('tr[data-filename]');
+                    rows.forEach(function(row) {
+                        var rowOutbounds = row.getAttribute('data-outbounds');
+                        var cCell = row.querySelector('.check-cell');
+                        var nCell = row.querySelector('.name-cell');
+                        var aBtn = row.querySelector('.cbi-button-apply');
+
+                        if (rowOutbounds && rowOutbounds === activeOutboundsStr) {
+                            if (cCell && !cCell.innerHTML.includes('✔')) cCell.innerHTML = '<span style="color:#46a546; font-weight:bold; font-size:1.2em;">✔</span>';
+                            if (nCell && nCell.style.color !== 'rgb(70, 165, 70)') { nCell.style.fontWeight = 'bold'; nCell.style.color = '#46a546'; }
+                            if (aBtn && aBtn.textContent !== _('生效中')) { aBtn.disabled = false; aBtn.textContent = _('生效中'); }
+                        } else if (rowOutbounds) {
+                            if (cCell && cCell.innerHTML !== '') cCell.innerHTML = '';
+                            if (nCell && (nCell.style.fontWeight === 'bold' || nCell.style.color)) { nCell.style.fontWeight = 'normal'; nCell.style.color = ''; }
+                            if (aBtn && aBtn.textContent === _('生效中')) { aBtn.disabled = false; aBtn.textContent = _('選用'); }
+                        }
+                    });
+                }, this)).catch(function(){});
+            }
         }, this)).catch(function(){});
     },
 
@@ -353,7 +339,14 @@ return L.view.extend({
 
     handleSwitch: function(filename, confdir, ev) {
         var btn = ev.target;
-        btn.disabled = true; btn.textContent = _('正在應用...');
+        if (btn.textContent.trim() === _('生效中')) {
+            alert(_('該配置已在生效中，無須重複應用。'));
+            return;
+        }
+
+        btn.disabled = true; 
+        btn.textContent = _('正在應用...');
+        this.lastSwitchTime = Date.now(); // 啟用樂觀鎖
 
         L.fs.read(confdir + '/' + filename).then(L.bind(function(content) {
             return L.fs.write(confdir + '/config.json', content);
@@ -361,27 +354,64 @@ return L.view.extend({
             L.uci.set('sing-box', 'main', 'selected_conf', filename);
             return L.uci.save().then(function() { return L.uci.apply(); });
         }, this)).then(L.bind(function() {
+            try {
+                var indicator = document.getElementById('changes_indicator_config') || document.getElementById('indicators');
+                if (indicator) { indicator.style.display = 'none'; indicator.innerHTML = ''; }
+                var argonIndicator = document.querySelector('.uci_change_indicator') || document.querySelector('.changes-indicator');
+                if (argonIndicator) { argonIndicator.style.display = 'none'; argonIndicator.remove(); }
+            } catch(domErr) { console.log("消除提示失敗:", domErr); }
+
             return this.doRestart().catch(function() { throw new Error(_('重啟服務失敗')); });
         }, this)).then(L.bind(function() {
+            // 樂觀 UI 渲染
             var rows = document.querySelectorAll('tr[data-filename]');
             rows.forEach(function(row) {
-                var isTarget = (row.getAttribute('data-filename') === filename);
-                row.querySelector('.check-cell').innerHTML = isTarget ? '<span style="color:#46a546; font-weight:bold; font-size:1.2em;">✔</span>' : '';
-                row.querySelector('.name-cell').style.fontWeight = isTarget ? 'bold' : 'normal';
-                row.querySelector('.name-cell').style.color = isTarget ? '#46a546' : '';
-                row.querySelector('.cbi-button-apply').textContent = isTarget ? _('生效中') : _('選用');
+                var f = row.getAttribute('data-filename');
+                var cCell = row.querySelector('.check-cell');
+                var nCell = row.querySelector('.name-cell');
+                var aBtn = row.querySelector('.cbi-button-apply');
+                if (f === filename) {
+                    if (cCell) cCell.innerHTML = '<span style="color:#46a546; font-weight:bold; font-size:1.2em;">✔</span>';
+                    if (nCell) { nCell.style.fontWeight = 'bold'; nCell.style.color = '#46a546'; }
+                    if (aBtn) { aBtn.disabled = false; aBtn.textContent = _('生效中'); }
+                } else {
+                    if (cCell) cCell.innerHTML = '';
+                    if (nCell) { nCell.style.fontWeight = 'normal'; nCell.style.color = ''; }
+                    if (aBtn) { aBtn.disabled = false; aBtn.textContent = _('選用'); }
+                }
             });
-            btn.disabled = false;
+
             window.sessionStorage.removeItem('sb_net_cache');
             this.checkNetwork(true);
+
+            setTimeout(L.bind(function() {
+                var container = document.getElementById('sb_file_list_container');
+                if (container) { this.renderList(container, confdir, filename); }
+            }, this), 3500);
+
         }, this)).catch(function(e) { 
             btn.disabled = false; btn.textContent = _('選用');
             alert(e.message || _('操作失敗，請檢查權限')); 
         });
     },
 
+    // --- 【修復＆同步核心 2】：為每行數據綁定結構指紋，利於 checkStatus 動態對比 ---
     renderList: function(container, confdir, selectedConf) {
-        return L.fs.list(confdir).then(L.bind(function(files) {
+        return Promise.all([
+            L.fs.list(confdir),
+            L.fs.read(confdir + '/config.json').catch(function() { return null; })
+        ]).then(L.bind(function(results) {
+            var files = results[0];
+            var configContent = results[1];
+            var activeOutboundsStr = "";
+
+            if (configContent) {
+                try {
+                    var configJson = JSON.parse(configContent);
+                    if (configJson.outbounds) { activeOutboundsStr = JSON.stringify(configJson.outbounds); }
+                } catch(e) {}
+            }
+
             files.sort(function(a, b) { return (b.mtime || 0) - (a.mtime || 0); });
 
             var table = E('table', { 'class': 'table cbi-section-table' }, [
@@ -394,14 +424,25 @@ return L.view.extend({
                 ])
             ]);
 
+            var rowsMap = {};
+
             files.forEach(L.bind(function(file) {
                 if (file.name.endsWith('.json') && file.name !== 'config.json') {
                     var isSelected = (file.name === selectedConf);
                     
+                    var checkCell = E('td', { 'class': 'td check-cell', 'style': 'text-align:center; vertical-align:middle;' }, [ isSelected ? E('span', { 'style': 'color:#46a546; font-weight:bold; font-size:1.2em;' }, '✔') : '' ]);
+                    var nameCell = E('td', { 'class': 'td name-cell', 'style': 'vertical-align:middle; font-size:1.05em; ' + (isSelected ? 'font-weight:bold; color:#46a546;' : '') }, file.name);
                     var typeCell = E('td', { 'class': 'td', 'style': 'vertical-align:middle; color:#555; font-size:1.05em; font-weight:bold; text-transform:uppercase; padding-right:15px;' }, _('讀取中...'));
                     var infoCell = E('td', { 'class': 'td', 'style': 'vertical-align:middle; color:#666; font-size:1.05em; word-break:break-word; padding-right:15px;' }, '');
+                    var applyBtn = E('button', { 
+                        'class': 'cbi-button cbi-button-apply', 
+                        'style': 'padding:7px 22px; border-radius:100px; background:#46a546 !important; color:#fff !important; border:none; font-size:1.05em; font-weight:500;',
+                        'click': L.bind(this.handleSwitch, this, file.name, confdir) 
+                    }, isSelected ? _('生效中') : _('選用'));
 
-                    L.fs.read(confdir + '/' + file.name).then(function(res) {
+                    rowsMap[file.name] = { checkCell: checkCell, nameCell: nameCell, applyBtn: applyBtn };
+
+                    L.fs.read(confdir + '/' + file.name).then(L.bind(function(res) {
                         if (!res) { typeCell.textContent = '-'; return; }
                         try {
                             var json = JSON.parse(res);
@@ -409,48 +450,57 @@ return L.view.extend({
                             if (json.outbounds && Array.isArray(json.outbounds)) {
                                 json.outbounds.forEach(function(out) {
                                     if (out.server && typeof out.server === 'string' && out.server !== '127.0.0.1' && out.server !== '::1') {
-                                        servers.push(out.server);
-                                        if (out.type) types.push(out.type);
+                                        servers.push(out.server); if (out.type) types.push(out.type);
                                     }
                                 });
                             }
                             typeCell.textContent = types.length > 0 ? types.filter(function(v, i, a) { return a.indexOf(v) === i; }).join(', ') : '-';
                             infoCell.textContent = servers.length > 0 ? servers.filter(function(v, i, a) { return a.indexOf(v) === i; }).join(', ') : '';
-                        } catch(e) {
-                            typeCell.textContent = 'JSON 錯誤'; typeCell.style.color = '#dc3545';
-                        }
-                    });
+                            
+                            // 【重要同步設定】：為對應行的 TR 注入當前文件的 outbounds 數據特徵字符串
+                            var rowTr = table.querySelector('tr[data-filename="' + file.name + '"]');
+                            if (rowTr && json.outbounds) {
+                                rowTr.setAttribute('data-outbounds', JSON.stringify(json.outbounds));
+                            }
+
+                            // 精準即時後台內容校正
+                            if (activeOutboundsStr && json.outbounds && JSON.stringify(json.outbounds) === activeOutboundsStr) {
+                                if (this.lastSwitchTime && (Date.now() - this.lastSwitchTime < 3000)) { return; }
+
+                                Object.keys(rowsMap).forEach(function(k) {
+                                    rowsMap[k].checkCell.innerHTML = '';
+                                    rowsMap[k].nameCell.style.fontWeight = 'normal';
+                                    rowsMap[k].nameCell.style.color = '';
+                                    rowsMap[k].applyBtn.textContent = _('選用');
+                                });
+                                checkCell.innerHTML = '<span style="color:#46a546; font-weight:bold; font-size:1.2em;">✔</span>';
+                                nameCell.style.fontWeight = 'bold';
+                                nameCell.style.color = '#46a546';
+                                applyBtn.textContent = _('生效中');
+                            }
+                        } catch(e) { typeCell.textContent = 'JSON 錯誤'; typeCell.style.color = '#dc3545'; }
+                    }, this));
 
                     table.appendChild(E('tr', { 'class': 'tr', 'data-filename': file.name }, [
-                        E('td', { 'class': 'td check-cell', 'style': 'text-align:center; vertical-align:middle;' }, [ isSelected ? E('span', { 'style': 'color:#46a546; font-weight:bold; font-size:1.2em;' }, '✔') : '' ]),
-                        E('td', { 'class': 'td name-cell', 'style': 'vertical-align:middle; font-size:1.05em; ' + (isSelected ? 'font-weight:bold; color:#46a546;' : '') }, file.name),
-                        typeCell,
-                        infoCell,
+                        checkCell, nameCell, typeCell, infoCell,
                         E('td', { 'class': 'td', 'style': 'text-align:center; vertical-align:middle; white-space:nowrap; width:320px;' }, [
-                            E('button', { 
-                                'class': 'cbi-button cbi-button-apply', 
-                                'style': 'padding:7px 22px; border-radius:100px; background:#46a546 !important; color:#fff !important; border:none; font-size:1.05em; font-weight:500;',
-                                'click': L.bind(this.handleSwitch, this, file.name, confdir) 
-                            }, isSelected ? _('生效中') : _('選用')),
+                            applyBtn,
                             E('button', { 
                                 'class': 'cbi-button cbi-button-neutral', 
                                 'style': 'margin-left:8px; padding:7px 22px; border-radius:100px; background:#999 !important; color:#fff !important; border:none; font-size:1.05em; font-weight:500;', 
                                 'click': L.bind(function() {
-                                    L.fs.read(confdir + '/' + file.name).then(L.bind(function(content) {
-                                        this.openEditor(file.name, content, confdir);
-                                    }, this)).catch(function(){ alert(_('無法讀取文件')); });
+                                    L.fs.read(confdir + '/' + file.name).then(L.bind(function(content) { this.openEditor(file.name, content, confdir); }, this)).catch(function(){ alert(_('無法讀取文件')); });
                                 }, this) 
                             }, _('編輯')),
                             E('button', { 
                                 'class': 'cbi-button cbi-button-remove', 
                                 'style': 'margin-left:8px; padding:7px 22px; border-radius:100px; background:#dc3545 !important; color:#fff !important; border:none; font-size:1.05em; font-weight:500;', 
                                 'click': L.bind(function(ev) { 
-                                if (confirm(_('確定刪除此配置嗎？'))) {
-                                    L.fs.remove(confdir + '/' + file.name).then(L.bind(function(){ 
-                                        ev.target.closest('tr').remove(); 
-                                    }, this)).catch(function(){ alert(_('刪除失敗')); }); 
-                                }
-                            }, this) }, _('刪除'))
+                                    if (confirm(_('確定刪除此配置嗎？'))) {
+                                        L.fs.remove(confdir + '/' + file.name).then(L.bind(function(){ ev.target.closest('tr').remove(); }, this)).catch(function(){ alert(_('刪除失敗')); }); 
+                                    }
+                                }, this) 
+                            }, _('刪除'))
                         ])
                     ]));
                 }
@@ -472,7 +522,8 @@ return L.view.extend({
 
         s.render = L.bind(function() {
             if (this.statusTimer) window.clearInterval(this.statusTimer);
-            this.statusTimer = window.setInterval(L.bind(this.checkStatus, this), 5000);
+            // 【核心修正】：向 checkStatus 傳遞 confdir，藉此開啟高頻非同步同步
+            this.statusTimer = window.setInterval(L.bind(this.checkStatus, this, confdir), 5000);
 
             var cached = this.getCache();
             var labelText = '', labelBg = 'transparent';
@@ -481,10 +532,7 @@ return L.view.extend({
             else if (cached === 'cn_only') { labelText = _('僅國內連通'); labelBg = '#ffc107'; } 
             else if (cached === 'global_only') { labelText = _('僅國外連通'); labelBg = '#6f42c1'; } 
             else if (cached === 'offline') { labelText = _('網路已斷開'); labelBg = '#dc3545'; } 
-            else {
-                labelText = _('連通性測試中...'); labelBg = '#17a2b8';
-                setTimeout(L.bind(this.checkNetwork, this, true), 100);
-            }
+            else { labelText = _('連通性測試中...'); labelBg = '#17a2b8'; setTimeout(L.bind(this.checkNetwork, this, true), 100); }
 
             return E('div', { 'class': 'cbi-value', 'style': 'display:flex; flex-direction:column; border-bottom:1px solid #eee; padding-bottom:10px;' }, [
                 E('div', { 'style': 'display:flex; align-items:center; width:100%; margin-bottom:10px;' }, [
@@ -499,28 +547,14 @@ return L.view.extend({
                             E('span', { 'id': 'sb_net_text', 'style': 'font-weight:bold; color:#444;' }, labelText)
                         ]),
                         E('button', { 'class': 'cbi-button', 'style': 'margin-left:auto; padding:6px 20px; border-radius:100px; background:#46a546 !important; color:#fff !important; border:none;', 'click': L.bind(function(ev) {
-                            ev.target.textContent = _('正在重啟...');
-                            window.sessionStorage.removeItem('sb_net_cache');
-                            return this.doRestart().then(L.bind(function(){
-                                ev.target.textContent = _('重啟 sing-box');
-                                setTimeout(L.bind(this.checkStatus, this), 1000);
-                            }, this));
+                            ev.target.textContent = _('正在重啟...'); window.sessionStorage.removeItem('sb_net_cache');
+                            return this.doRestart().then(L.bind(function(){ ev.target.textContent = _('重啟 sing-box'); setTimeout(L.bind(this.checkStatus, this, confdir), 1000); }, this));
                         }, this) }, _('重啟 sing-box')),
                         E('button', { 'class': 'cbi-button', 'style': 'margin-left:10px; padding:6px 20px; border-radius:100px; background:#999 !important; color:#fff !important; border:none;', 'click': L.bind(function(ev) {
-                            ev.target.textContent = _('正在停止...');
-                            window.sessionStorage.removeItem('sb_net_cache');
-                            return this.doStop().then(L.bind(function(){
-                                ev.target.textContent = _('停止 sing-box');
-                                setTimeout(L.bind(this.checkStatus, this), 600);
-                            }, this));
+                            ev.target.textContent = _('正在停止...'); window.sessionStorage.removeItem('sb_net_cache');
+                            return this.doStop().then(L.bind(function(){ ev.target.textContent = _('停止 sing-box'); setTimeout(L.bind(this.checkStatus, this, confdir), 600); }, this));
                         }, this) }, _('停止 sing-box')),
-                        E('button', { 
-                            'class': 'cbi-button cbi-button-add', 
-                            'style': 'margin-left:10px; padding:6px 20px; border-radius:100px;', 
-                            'click': L.bind(function() { 
-                                this.openEditor(null, null, confdir); 
-                            }, this) 
-                        }, _('⚡ 快速導入 / 新建'))
+                        E('button', { 'class': 'cbi-button cbi-button-add', 'style': 'margin-left:10px; padding:6px 20px; border-radius:100px;', 'click': L.bind(function() { this.openEditor(null, null, confdir); }, this) }, _('⚡ 快速導入 / 新建'))
                     ])
                 ])
             ]);
