@@ -18,7 +18,11 @@ return L.view.extend({
         try {
             return decodeURIComponent(escape(window.atob(str)));
         } catch (e) {
-            return window.atob(str); // 降級處理
+            try {
+                return window.atob(str);
+            } catch(e2) {
+                return "";
+            }
         }
     },
 
@@ -76,23 +80,71 @@ return L.view.extend({
             if (['vless', 'trojan', 'hysteria2'].indexOf(protocol) !== -1) {
                 var authAddr = mainUrl.split('@');
                 var uuidOrPwd = authAddr[0];
-                var addrPart = authAddr[1].split(':');
-                var host = addrPart[0];
-                var port = parseInt(addrPart[1]);
+                
+                // 健壮分离 host 和未处理的原始端口字符串
+                var remainAddr = authAddr[1];
+                var firstColonIdx = remainAddr.indexOf(':');
+                var host = (firstColonIdx !== -1) ? remainAddr.substring(0, firstColonIdx) : remainAddr;
+                var rawPortStr = (firstColonIdx !== -1) ? remainAddr.substring(firstColonIdx + 1) : "";
 
-                node = { type: protocol, tag: name, server: host, server_port: port };
+                node = { type: protocol, tag: name, server: host };
                 if (protocol === 'trojan' || protocol === 'hysteria2') node.password = uuidOrPwd;
                 else node.uuid = uuidOrPwd;
 
                 if (protocol === 'vless') {
-                    node.packet_encoding = "xudp"; 
+                    node.packet_encoding = "xudp";
                     if (query.flow) { node.flow = query.flow; }
+                }
+
+                // --- 🚀 Hysteria2 端口及跳跃精准解析逻辑（支持链接尾部 mport 参数形式） ---
+                var serverPortsArray = [];
+                var mainPort = null;
+
+                // 1. 首选解析链接自带的主端口
+                if (rawPortStr) {
+                    var portParts = rawPortStr.split(',');
+                    for (var p = 0; p < portParts.length; p++) {
+                        var part = portParts[p].trim();
+                        if (!part) continue;
+                        if (part.indexOf('-') !== -1) {
+                            serverPortsArray.push(part.replace('-', ':'));
+                        } else {
+                            if (!mainPort) mainPort = parseInt(part);
+                            else serverPortsArray.push(part);
+                        }
+                    }
+                }
+
+                // 2. 核心修复：针对你提供的 &mport=32000-35000 参数进行补强提取
+                var rawMport = query.mport || query.mports || "";
+                if (protocol === 'hysteria2' && rawMport) {
+                    var mportParts = rawMport.split(',');
+                    for (var m = 0; m < mportParts.length; m++) {
+                        var mPart = mportParts[m].trim();
+                        if (!mPart) continue;
+                        if (mPart.indexOf('-') !== -1) {
+                            serverPortsArray.push(mPart.replace('-', ':'));
+                        } else {
+                            serverPortsArray.push(mPart);
+                        }
+                    }
+                }
+
+                // 3. 按照你要求的标准结构落盘生成 JSON (已成功补全 Hysteria2 上下载带宽参数)
+                node["server_port"] = mainPort || 443;
+                if (protocol === 'hysteria2') {
+                    node["up_mbps"] = parseInt(query.up_mbps || query.up) || 50;
+                    node["down_mbps"] = parseInt(query.down_mbps || query.down) || 50;
+                    if (serverPortsArray.length > 0) {
+                        node["server_ports"] = serverPortsArray;
+                        node["hop_interval"] = "30s";
+                    }
                 }
 
                 if (query.security === 'tls' || query.security === 'reality' || protocol === 'hysteria2' || protocol === 'trojan') {
                     node.tls = { enabled: true, server_name: query.sni || query.peer || host, insecure: (query.allowInsecure === '1' || query.insecure === '1') };
                     if (query.alpn) { node.tls.alpn = query.alpn.split(','); }
-                    if (query.fp) { node.tls.utls = { enabled: true, fingerprint: query.fp }; } 
+                    if (query.fp) { node.tls.utls = { enabled: true, fingerprint: query.fp }; }
                     else if (query.security === 'reality') { node.tls.utls = { enabled: true, fingerprint: "chrome" }; }
                     if (query.security === 'reality') { node.tls.reality = { enabled: true, public_key: query.pbk, short_id: query.sid || "" }; }
                 }
@@ -126,17 +178,14 @@ return L.view.extend({
         var isNew = !filename;
         var currentName = filename || '';
         var content = initialContent || '{\n  "outbounds": []\n}';
-
         var linkInput = E('input', { 
             'class': 'cbi-input-text', 
             'style': 'flex:1; border: 2px dashed #46a546; background: #f9fff9; padding: 10px;', 
             'placeholder': _('⚡ 點擊此處粘貼節點鏈接 (Vmess/Vless/Trojan/SS/Hy2) ，將自動生成並覆蓋當前配置...') 
         });
         var nameInput = E('input', { 'class': 'cbi-input-text', 'style': 'width:250px; font-weight:bold; color:#46a546;', 'placeholder': _('文件名 (如: HK-01.json)'), 'value': currentName });
-        
         var linesContainer = E('div', { 'style': 'width:40px; text-align:right; padding:10px 5px; background:#f5f5f5; color:#999; font-family:monospace; font-size:13px; overflow:hidden; border-right:1px solid #ccc; user-select:none;' }, '1');
         var ta = E('textarea', { 'style': 'flex:1; width:100%; min-height:250px; max-height:50vh; font-family:monospace; font-size:13px; padding:10px; box-sizing:border-box; border:none; outline:none; white-space:pre; overflow-x:auto; resize:vertical;' }, [ content ]);
-        
         var updateLineNumbers = function() {
             var lines = ta.value.split('\n').length + 5;
             var html = '';
@@ -146,7 +195,6 @@ return L.view.extend({
         ta.addEventListener('scroll', function() { linesContainer.scrollTop = ta.scrollTop; });
         ta.addEventListener('input', updateLineNumbers);
         setTimeout(updateLineNumbers, 50);
-
         linkInput.addEventListener('input', L.bind(function(e) {
             var val = e.target.value.trim();
             if (!val || !/^[a-zA-Z0-9]+:\/\//.test(val)) return;
@@ -167,7 +215,6 @@ return L.view.extend({
                         "final": node.tag
                     }
                 };
-                
                 ta.value = JSON.stringify(standardConfig, null, 4);
                 var originalBg = linkInput.style.background;
                 linkInput.style.background = '#d4edda';
@@ -176,7 +223,6 @@ return L.view.extend({
                 updateLineNumbers();
             }
         }, this));
-
         L.ui.showModal(isNew ? _('✨ 新建/導入配置') : _('✏️ 編輯配置: ') + filename, [ 
             E('div', { 'style': 'display:flex; margin-bottom:15px; padding-bottom:15px; border-bottom:1px dashed #ccc;' }, [ linkInput ]),
             E('div', { 'style': 'display:flex; align-items:center; gap:10px; margin-bottom:10px;' }, [
@@ -186,8 +232,10 @@ return L.view.extend({
             ]),
             E('div', { 'style': 'border:1px solid #ccc; display:flex; margin-bottom:15px; max-height:55vh; overflow:hidden; border-radius:4px;' }, [ linesContainer, ta ]),
             E('div', { 'class': 'right', 'style': 'display:flex; gap:10px; align-items:center;' }, [
-                E('button', { 'class': 'btn cbi-button-neutral', 'click': function() { 
-                    try { JSON.parse(ta.value); alert(_('JSON 格式正確 ✔')); } catch(e) { alert(_('語法錯誤: ') + e.message); }
+                E('button', { 'class': 'btn cbi-button-neutral', 
+                'click': function() { 
+                    try { JSON.parse(ta.value); alert(_('JSON 格式正確 ✔'));
+                } catch(e) { alert(_('語法錯誤: ') + e.message); }
                 }}, _('檢查語法')),
                 E('button', { 'class': 'btn cbi-button-neutral', 'click': function() { 
                     try { var obj = JSON.parse(ta.value); ta.value = JSON.stringify(obj, null, 4); updateLineNumbers(); } 
@@ -237,6 +285,117 @@ return L.view.extend({
         ]);
     },
 
+    // --- 🚀 新增功能：批量訂閱導入彈窗與解析落盤 ---
+    openSubscriptionImporter: function(confdir) {
+        var subInput = E('input', {
+            'class': 'cbi-input-text',
+            'style': 'flex:1; padding: 10px; border: 2px dashed #007bff; background: #f0f7ff;',
+            'placeholder': _('🔗 請在此粘貼機場訂閱鏈接 (HTTP/HTTPS) ...')
+        });
+        L.ui.showModal(_('🚀 批量訂閱導入'), [
+            E('div', { 'style': 'display:flex; flex-direction:column; gap:15px; min-width:500px;' }, [
+                E('div', { 'style': 'display:flex;' }, [ subInput ]),
+                E('div', { 'style': 'color:#666; font-size:0.95em; line-height:1.5;' }, [
+                    _('說明：粘貼完整的訂閱鏈接後點擊導入，系統會自動下載並解析其中包含的 Vmess / Vless / Trojan / Shadowsocks / Hysteria2 節點，並在指定目錄批量生成獨立配置。')
+                ]),
+                E('div', { 'class': 'right', 'style': 'display:flex; gap:10px; justify-content:flex-end; margin-top:10px;' }, [
+                    E('button', { 'class': 'btn', 'click': L.ui.hideModal }, _('取消')),
+                    E('button', {
+                        'class': 'btn cbi-button-positive',
+                        'style': 'background:#007bff !important;',
+                        'click': L.bind(function(ev) {
+                            var url = subInput.value.trim();
+                            if (!url || !/^https?:\/\//i.test(url)) {
+                                alert(_('請輸入有效的 HTTP/HTTPS 訂閱鏈接！'));
+                                return;
+                            }
+
+                            var btn = ev.target;
+                            btn.disabled = true;
+                            btn.textContent = _('正在下載並解析...');
+
+                            // 使用 /bin/sh -c 包装 curl 下载，绕过浏览器跨域和 LuCI 权限限制
+                            L.fs.exec('/bin/sh', ['-c', 'curl -s -L -k --connect-timeout 15 "' + url.replace(/"/g, '\\"') + '"'])
+                            .then(function(res) {
+                                if (res.code !== 0) throw new Error(_('網絡獲取訂閱失敗，請檢查路由器連通性。'));
+                                return res.stdout;
+                            })
+                            .then(L.bind(function(rawBody) {
+                                if (!rawBody || rawBody.trim() === "") throw new Error(_('訂閱內容為空'));
+                                
+                                var decodedContent = this.safeB64Decode(rawBody.trim());
+                                if (!decodedContent || decodedContent.trim() === "") {
+                                    decodedContent = rawBody; 
+                                }
+
+                                var lines = decodedContent.split(/[\r\n]+/);
+                                var validNodes = [];
+                                
+                                for (var i = 0; i < lines.length; i++) {
+                                    var line = lines[i].trim();
+                                    if (!line || !/^[a-zA-Z0-9]+:\/\//.test(line)) continue;
+                                    
+                                    var nodeObj = this.parseNodeLink(line);
+                                    if (nodeObj) {
+                                        validNodes.push(nodeObj);
+                                    }
+                                }
+
+                                if (validNodes.length === 0) {
+                                    throw new Error(_('訂閱中未探測到受支持的有效節點鏈接！'));
+                                }
+
+                                var writePromises = [];
+                                var nameCounter = {};
+
+                                validNodes.forEach(L.bind(function(node) {
+                                    var baseName = (node.tag || 'Imported-Node').replace(/[^a-zA-Z0-9_\-\u4e00-\u9fa5]/g, '_');
+                                    
+                                    if (!nameCounter[baseName]) {
+                                        nameCounter[baseName] = 1;
+                                    } else {
+                                        nameCounter[baseName]++;
+                                        baseName += '_' + nameCounter[baseName];
+                                    }
+
+                                    var finalFileName = baseName + '.json';
+
+                                    var standardConfig = {
+                                        "log": { "level": "info", "timestamp": true },
+                                        "inbounds": [ { "type": "socks", "tag": "socks-in", "listen": "0.0.0.0", "listen_port": 10811, "udp_fragment": true } ],
+                                        "outbounds": [ node ],
+                                        "route": {
+                                            "rules": [ { "inbound": "socks-in", "action": "route", "outbound": node.tag } ],
+                                            "final": node.tag
+                                        }
+                                    };
+                                    var task = L.fs.write(confdir + '/' + finalFileName, JSON.stringify(standardConfig, null, 4));
+                                    writePromises.push(task);
+                                }, this));
+
+                                return Promise.all(writePromises).then(L.bind(function() {
+                                    alert(_('🎉 成功批量導入 ') + validNodes.length + _(' 個節點配置檔案！'));
+                                    L.ui.hideModal();
+                                    
+                                    var container = document.getElementById('sb_file_list_container');
+                                    if (container) {
+                                        this.renderList(container, confdir, L.uci.get('sing-box', 'main', 'selected_conf'));
+                                    }
+                                }, this));
+
+                            }, this))
+                            .catch(function(err) {
+                                btn.disabled = false;
+                                btn.textContent = _('確認導入');
+                                alert(_('導入失敗: ') + (err.message || err));
+                            });
+                        }, this)
+                    }, _('確認導入'))
+                ])
+            ])
+        ]);
+    },
+
     getCache: function() { return window.sessionStorage.getItem('sb_net_cache'); },
     setCache: function(val) { window.sessionStorage.setItem('sb_net_cache', val); },
 
@@ -259,7 +418,6 @@ return L.view.extend({
 
         var cmdCn = 'curl -I -s --connect-timeout 2 http://223.5.5.5 >/dev/null 2>&1 && exit 0 || exit 1';
         var cmdGlobal = 'curl -I -s --connect-timeout 2 http://www.google.com/generate_204 >/dev/null 2>&1 && exit 0 || exit 1';
-
         Promise.all([
             L.fs.exec('/bin/sh', ['-c', cmdCn]).catch(function() { return { code: 1 }; }),
             L.fs.exec('/bin/sh', ['-c', cmdGlobal]).catch(function() { return { code: 1 }; })
@@ -283,7 +441,6 @@ return L.view.extend({
         });
     },
 
-    // --- 【修復＆同步核心 1】：動態靜默更新列表節點選中狀態，防止與 Web 端發生衝突 ---
     checkStatus: function(confdir) {
         return L.fs.exec('/etc/init.d/sing-box', ['status']).then(L.bind(function(res) {
             var isRunning = (res.code === 0);
@@ -295,12 +452,10 @@ return L.view.extend({
             }
             this.checkNetwork(false);
 
-            // 【樂觀鎖阻斷】：如果本地剛切換了節點未滿 3 秒，暫停後台的覆蓋比對，避免重啟延遲導致的閃爍跳動
             if (this.lastSwitchTime && (Date.now() - this.lastSwitchTime < 3000)) {
                 return;
             }
 
-            // 【非同步指紋比對】：直接讀取當前物理 config.json 的 outbounds，從而同步 Web 端的變更
             if (confdir) {
                 L.fs.read(confdir + '/config.json').then(L.bind(function(configContent) {
                     if (!configContent) return;
@@ -311,7 +466,6 @@ return L.view.extend({
                     } catch(e) { return; }
 
                     if (!activeOutboundsStr) return;
-
                     var rows = document.querySelectorAll('tr[data-filename]');
                     rows.forEach(function(row) {
                         var rowOutbounds = row.getAttribute('data-outbounds');
@@ -344,10 +498,9 @@ return L.view.extend({
             return;
         }
 
-        btn.disabled = true; 
+        btn.disabled = true;
         btn.textContent = _('正在應用...');
-        this.lastSwitchTime = Date.now(); // 啟用樂觀鎖
-
+        this.lastSwitchTime = Date.now();
         L.fs.read(confdir + '/' + filename).then(L.bind(function(content) {
             return L.fs.write(confdir + '/config.json', content);
         }, this)).then(L.bind(function() {
@@ -359,11 +512,12 @@ return L.view.extend({
                 if (indicator) { indicator.style.display = 'none'; indicator.innerHTML = ''; }
                 var argonIndicator = document.querySelector('.uci_change_indicator') || document.querySelector('.changes-indicator');
                 if (argonIndicator) { argonIndicator.style.display = 'none'; argonIndicator.remove(); }
-            } catch(domErr) { console.log("消除提示失敗:", domErr); }
+            } catch(domErr) {
+                console.log("消除提示失敗:", domErr); 
+            }
 
             return this.doRestart().catch(function() { throw new Error(_('重啟服務失敗')); });
         }, this)).then(L.bind(function() {
-            // 樂觀 UI 渲染
             var rows = document.querySelectorAll('tr[data-filename]');
             rows.forEach(function(row) {
                 var f = row.getAttribute('data-filename');
@@ -380,7 +534,6 @@ return L.view.extend({
                     if (aBtn) { aBtn.disabled = false; aBtn.textContent = _('選用'); }
                 }
             });
-
             window.sessionStorage.removeItem('sb_net_cache');
             this.checkNetwork(true);
 
@@ -388,14 +541,12 @@ return L.view.extend({
                 var container = document.getElementById('sb_file_list_container');
                 if (container) { this.renderList(container, confdir, filename); }
             }, this), 3500);
-
-        }, this)).catch(function(e) { 
+        }, this)).catch(function(e) {
             btn.disabled = false; btn.textContent = _('選用');
             alert(e.message || _('操作失敗，請檢查權限')); 
         });
     },
 
-    // --- 【修復＆同步核心 2】：為每行數據綁定結構指紋，利於 checkStatus 動態對比 ---
     renderList: function(container, confdir, selectedConf) {
         return Promise.all([
             L.fs.list(confdir),
@@ -423,7 +574,6 @@ return L.view.extend({
                     E('th', { 'class': 'th', 'style': 'width:320px; text-align:center; font-size:1.05em; font-weight:bold;' }, _('管理操作'))
                 ])
             ]);
-
             var rowsMap = {};
 
             files.forEach(L.bind(function(file) {
@@ -435,13 +585,11 @@ return L.view.extend({
                     var typeCell = E('td', { 'class': 'td', 'style': 'vertical-align:middle; color:#555; font-size:1.05em; font-weight:bold; text-transform:uppercase; padding-right:15px;' }, _('讀取中...'));
                     var infoCell = E('td', { 'class': 'td', 'style': 'vertical-align:middle; color:#666; font-size:1.05em; word-break:break-word; padding-right:15px;' }, '');
                     var applyBtn = E('button', { 
-                        'class': 'cbi-button cbi-button-apply', 
+                        'class': 'cbi-button cbi-button-apply',
                         'style': 'padding:7px 22px; border-radius:100px; background:#46a546 !important; color:#fff !important; border:none; font-size:1.05em; font-weight:500;',
-                        'click': L.bind(this.handleSwitch, this, file.name, confdir) 
+                        'click': L.bind(this.handleSwitch, this, file.name, confdir)
                     }, isSelected ? _('生效中') : _('選用'));
-
                     rowsMap[file.name] = { checkCell: checkCell, nameCell: nameCell, applyBtn: applyBtn };
-
                     L.fs.read(confdir + '/' + file.name).then(L.bind(function(res) {
                         if (!res) { typeCell.textContent = '-'; return; }
                         try {
@@ -456,14 +604,11 @@ return L.view.extend({
                             }
                             typeCell.textContent = types.length > 0 ? types.filter(function(v, i, a) { return a.indexOf(v) === i; }).join(', ') : '-';
                             infoCell.textContent = servers.length > 0 ? servers.filter(function(v, i, a) { return a.indexOf(v) === i; }).join(', ') : '';
-                            
-                            // 【重要同步設定】：為對應行的 TR 注入當前文件的 outbounds 數據特徵字符串
                             var rowTr = table.querySelector('tr[data-filename="' + file.name + '"]');
                             if (rowTr && json.outbounds) {
                                 rowTr.setAttribute('data-outbounds', JSON.stringify(json.outbounds));
                             }
 
-                            // 精準即時後台內容校正
                             if (activeOutboundsStr && json.outbounds && JSON.stringify(json.outbounds) === activeOutboundsStr) {
                                 if (this.lastSwitchTime && (Date.now() - this.lastSwitchTime < 3000)) { return; }
 
@@ -478,9 +623,11 @@ return L.view.extend({
                                 nameCell.style.color = '#46a546';
                                 applyBtn.textContent = _('生效中');
                             }
-                        } catch(e) { typeCell.textContent = 'JSON 錯誤'; typeCell.style.color = '#dc3545'; }
+                        } catch(e) { 
+                            typeCell.textContent = 'JSON 錯誤';
+                            typeCell.style.color = '#dc3545'; 
+                        }
                     }, this));
-
                     table.appendChild(E('tr', { 'class': 'tr', 'data-filename': file.name }, [
                         checkCell, nameCell, typeCell, infoCell,
                         E('td', { 'class': 'td', 'style': 'text-align:center; vertical-align:middle; white-space:nowrap; width:320px;' }, [
@@ -515,14 +662,11 @@ return L.view.extend({
         var isRunning = data[1];
         var confdir = L.uci.get('sing-box', 'main', 'confdir') || '/etc/sing-box';
         var selectedConf = L.uci.get('sing-box', 'main', 'selected_conf');
-
         var m = new L.form.Map('sing-box', _('Sing-box Bridge'), _('SING-BOX 服務管理'));
         var s = m.section(L.form.TypedSection, '_status', _('服務控制'));
         s.anonymous = true;
-
         s.render = L.bind(function() {
             if (this.statusTimer) window.clearInterval(this.statusTimer);
-            // 【核心修正】：向 checkStatus 傳遞 confdir，藉此開啟高頻非同步同步
             this.statusTimer = window.setInterval(L.bind(this.checkStatus, this, confdir), 5000);
 
             var cached = this.getCache();
@@ -532,7 +676,11 @@ return L.view.extend({
             else if (cached === 'cn_only') { labelText = _('僅國內連通'); labelBg = '#ffc107'; } 
             else if (cached === 'global_only') { labelText = _('僅國外連通'); labelBg = '#6f42c1'; } 
             else if (cached === 'offline') { labelText = _('網路已斷開'); labelBg = '#dc3545'; } 
-            else { labelText = _('連通性測試中...'); labelBg = '#17a2b8'; setTimeout(L.bind(this.checkNetwork, this, true), 100); }
+            else { 
+                labelText = _('連通性測試中...'); 
+                labelBg = '#17a2b8'; 
+                setTimeout(L.bind(this.checkNetwork, this, true), 100); 
+            }
 
             return E('div', { 'class': 'cbi-value', 'style': 'display:flex; flex-direction:column; border-bottom:1px solid #eee; padding-bottom:10px;' }, [
                 E('div', { 'style': 'display:flex; align-items:center; width:100%; margin-bottom:10px;' }, [
@@ -554,7 +702,12 @@ return L.view.extend({
                             ev.target.textContent = _('正在停止...'); window.sessionStorage.removeItem('sb_net_cache');
                             return this.doStop().then(L.bind(function(){ ev.target.textContent = _('停止 sing-box'); setTimeout(L.bind(this.checkStatus, this, confdir), 600); }, this));
                         }, this) }, _('停止 sing-box')),
-                        E('button', { 'class': 'cbi-button cbi-button-add', 'style': 'margin-left:10px; padding:6px 20px; border-radius:100px;', 'click': L.bind(function() { this.openEditor(null, null, confdir); }, this) }, _('⚡ 快速導入 / 新建'))
+                        E('button', { 'class': 'cbi-button cbi-button-add', 'style': 'margin-left:10px; padding:6px 20px; border-radius:100px;', 'click': L.bind(function() { this.openEditor(null, null, confdir); }, this) }, _('⚡ 快速導入 / 新建')),
+                        E('button', { 
+                            'class': 'cbi-button cbi-button-add', 
+                            'style': 'margin-left:10px; padding:6px 20px; border-radius:100px; background:#007bff !important; color:#fff !important; border:none;', 
+                            'click': L.bind(function() { this.openSubscriptionImporter(confdir); }, this) 
+                        }, _('🔄 訂閱導入'))
                     ])
                 ])
             ]);
@@ -564,9 +717,16 @@ return L.view.extend({
         s2.render = L.bind(function() {
             var container = E('div', { 'id': 'sb_file_list_container' });
             this.renderList(container, confdir, selectedConf);
-            return container;
-        }, this);
 
+            // 🚀 核心优化：在列表正下方精准生成三个橙色底部链接，并且用新窗口打开
+            var footerLinks = E('div', { 'style': 'margin-top: 25px; padding-top: 15px; border-top: 1px dashed #ddd; display: flex; gap: 25px; justify-content: center; font-size: 0.92em;' }, [
+                E('a', { 'href': 'https://dae-rule.bbsok.workers.dev/?ui=true', 'target': '_blank', 'style': 'color: #ff8c00; font-weight: bold; text-decoration: none;' }, _('DAED规则配置')),
+                E('a', { 'href': 'https://github.com/bslgw/jddy', 'target': '_blank', 'style': 'color: #ff8c00; font-weight: bold; text-decoration: none;' }, _('简单订阅管理')),
+                E('a', { 'href': 'https://github.com/bslgw/my-openwrt-brutal', 'target': '_blank', 'style': 'color: #ff8c00; font-weight: bold; text-decoration: none;' }, _('Brutal'))
+            ]);
+
+            return E('div', {}, [ container, footerLinks ]);
+        }, this);
         return m.render();
     }
 });
