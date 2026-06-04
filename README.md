@@ -9,11 +9,11 @@ openwrt控制台
 web界面，端口:2025
 
 
-## 除图片以外所有内容由google AI 生成
+
 
 ### luci-app-sing-box-bridge
 
-### 極簡 sing-box 管理界面，旨在作為 daed 外掛 sing-box 時提供高性能內核管理。
+### 極簡 sing-box 管理界面，旨在作為 daed 外掛 sing-box 時提供高性能节点管理
 
 ### 使用場景：
 
